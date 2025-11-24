@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore")
 
 
 def make_dataset(root, mode):
-    assert mode in ['train','val', 'test']
+    assert mode in ['train','val', 'test', 'unlabeled']
     items = []
 
     if mode == 'train':
@@ -49,6 +49,15 @@ def make_dataset(root, mode):
         for it_im, it_gt in zip(images, labels):
             item = (os.path.join(val_img_path, it_im), os.path.join(val_mask_path, it_gt))
             items.append(item)
+
+    elif mode == "unlabeled":
+        unl_img_path = os.path.join(root, "train", "Img-Unlabeled")
+       
+        images = sorted([x for x in os.listdir(unl_img_path) if x.endswith(".png")])
+        
+        for it_im in images:
+            items.append((os.path.join(unl_img_path, it_im), None))
+
     else:
         test_img_path = os.path.join(root, 'test', 'Img')
         test_mask_path = os.path.join(root, 'test', 'GT')
@@ -103,7 +112,11 @@ class MedicalImageDataset(Dataset):
     def __getitem__(self, index):
         img_path, mask_path = self.imgs[index]
         img = Image.open(img_path)
-        mask = Image.open(mask_path).convert('L')
+
+        if mask_path is None:
+            mask = None
+        else:
+            mask = Image.open(mask_path).convert("L")
 
         if self.equalize:
             img = ImageOps.equalize(img)
