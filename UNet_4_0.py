@@ -118,7 +118,7 @@ class HybridTransformerUNet2D(nn.Module):
     - Conv encoder (hierarchical) to produce multi-scale skips
     - At deepest level, create patch tokens from conv features and run Transformer
     - Project transformer tokens back to spatial map and decode with U-Net like decoder
-    Returns: logits (B, num_classes, H, W) OR (logits, aux1, aux2) if deep_supervision True
+    Returns: logits (B, num_classes, H, W) OR (logits, aux1, aux2, aux3) if deep_supervision True
     """
     def __init__(self,
                  in_channels=1,
@@ -131,7 +131,13 @@ class HybridTransformerUNet2D(nn.Module):
                  drop_path=0.0,
                  deep_supervision=True):
         super().__init__()
-        f = base_filters
+
+        # store hyperparams as attributes for later use
+        self.f = base_filters
+        self.num_classes = num_classes
+
+        f = self.f
+
         # encoder: conv stem -> enc1..enc4
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, f, kernel_size=3, padding=1, bias=False),
@@ -177,7 +183,6 @@ class HybridTransformerUNet2D(nn.Module):
                                               attn_drop=0.0, drop_path_prob=drop_path)
 
         # project tokens back to a spatial feature map
-        
         self.token_to_map = nn.Linear(embed_dim, f*8)  # maps token dim -> decoder feature channels
 
         # decoder projection conv to combine reprojected tokens
@@ -197,11 +202,15 @@ class HybridTransformerUNet2D(nn.Module):
             nn.Conv2d(f, num_classes, kernel_size=1)
         )
 
+        # deep supervision layers: defined once here with correct in_channels
         self.deep_supervision = deep_supervision
         if deep_supervision:
-            self.ds1 = nn.Conv2d(f, num_classes, 1)
-            self.ds2 = nn.Conv2d(f*2, num_classes, 1)
-            self.ds3 = nn.Conv2d(f*4, num_classes, 1)
+            # d1 -> out_ch = f
+            # d2 -> out_ch = f
+            # d3 -> out_ch = f*2
+            self.ds1 = nn.Conv2d(f, self.num_classes, 1)
+            self.ds2 = nn.Conv2d(f, self.num_classes, 1)
+            self.ds3 = nn.Conv2d(f*2, self.num_classes, 1)
 
         # init
         self._init_weights()
@@ -216,7 +225,7 @@ class HybridTransformerUNet2D(nn.Module):
                 if m.bias is not None: nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        # x: [B, 1, H, W]
+        # x: [B, C, H, W]
         B, C, H, W = x.shape
         s = self.stem(x)
         e1 = self.enc1(s)           # [B, f, H, W]
@@ -238,14 +247,12 @@ class HybridTransformerUNet2D(nn.Module):
         # map tokens back to spatial map
         # tokens -> [B, N, D] -> reshape [B, D, Hp, Wp]
         proj = self.token_to_map(tokens)          # [B, N, D2]
-        B, N, D2 = proj.shape
-        proj = proj.transpose(1,2).reshape(B, D2, Hp, Wp)  # [B, D2, Hp, Wp]
+        Bp, N, D2 = proj.shape
+        proj = proj.transpose(1,2).reshape(Bp, D2, Hp, Wp)  # [B, D2, Hp, Wp]
         proj = self.decoder_conv_proj(proj)       # [B, D2, Hp, Wp]
 
-        # Upsample proj to match p4 spatial if needed (here patch_size reduced spatially by patch_size)
-        # But our patch embedding used conv with stride=patch_size => Hp = H_p4 / patch_size
-        # To recover p4 size do interpolation:
-        p4_up = F.interpolate(proj, size=p4.shape[2:], mode='bilinear', align_corners=False)  # [B, D2, H/16, W/16]
+        # Upsample proj to match p4 spatial if needed
+        p4_up = F.interpolate(proj, size=p4.shape[2:], mode='bilinear', align_corners=False)
 
         # Decoder: combine with skips
         d4 = self.dec4(p4_up, e4)   # -> [B, 4f, H/8, W/8]
@@ -257,10 +264,15 @@ class HybridTransformerUNet2D(nn.Module):
         out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
 
         if self.deep_supervision:
-            ds3 = F.interpolate(self.ds3(d3), size=(H, W), mode='bilinear', align_corners=False)
-            ds2 = F.interpolate(self.ds2(d2), size=(H, W), mode='bilinear', align_corners=False)
-            ds1 = F.interpolate(self.ds1(d1), size=(H, W), mode='bilinear', align_corners=False)
-            return out, ds1, ds2, ds3
+            aux1 = self.ds1(d1)  # expects f channels
+            aux2 = self.ds2(d2)  # expects f channels
+            aux3 = self.ds3(d3)  # expects 2f channels
+
+            aux1 = F.interpolate(aux1, size=(H, W), mode='bilinear', align_corners=False)
+            aux2 = F.interpolate(aux2, size=(H, W), mode='bilinear', align_corners=False)
+            aux3 = F.interpolate(aux3, size=(H, W), mode='bilinear', align_corners=False)
+
+            return out, aux1, aux2, aux3
 
         return out
 
