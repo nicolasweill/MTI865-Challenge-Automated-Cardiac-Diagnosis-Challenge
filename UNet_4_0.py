@@ -1,133 +1,278 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from math import ceil
 
-class ResBlock(nn.Module):
-    """
-    Bloc Résiduel : Conv -> Norm -> LeakyReLU -> Conv -> Norm -> LeakyReLU + Residual
-    """
-    def __init__(self, in_channels, out_channels, stride=1):
+# ---------------------------
+# Utils
+# ---------------------------
+def drop_path(x, drop_prob: float = 0., training: bool = False):
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()
+    return x.div(keep_prob) * random_tensor
+
+class MLP(nn.Module):
+    def __init__(self, in_dim, mlp_dim, drop=0.):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride)
-        self.norm1 = nn.InstanceNorm2d(out_channels) # InstanceNorm > BatchNorm pour le médical
-        self.act1  = nn.LeakyReLU(negative_slope=0.01, inplace=True)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(mlp_dim, in_dim),
+            nn.Dropout(drop),
+        )
+    def forward(self,x): return self.net(x)
 
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.norm2 = nn.InstanceNorm2d(out_channels)
-        self.act2  = nn.LeakyReLU(negative_slope=0.01, inplace=True)
+# ---------------------------
+# Patch embedding from feature map (Conv stem -> patch tokens)
+# ---------------------------
+class PatchEmbedFromFeature(nn.Module):
+    """
+    Convert a CNN feature map (B, C, H, W) into patch tokens for Transformer:
+    - splits HxW into non-overlapping patches of size (patch_size x patch_size)
+    - flattens each patch and projects to embed_dim
+    """
+    def __init__(self, in_ch, embed_dim, patch_size=2):
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = nn.Conv2d(in_ch, embed_dim, kernel_size=patch_size, stride=patch_size)
+        # resulting tokens = (H/patch)*(W/patch)
+    def forward(self, x):
+        # x: [B, C, H, W]
+        x = self.proj(x)                 # [B, embed, Hp, Wp]
+        B, E, Hp, Wp = x.shape
+        x = x.flatten(2).transpose(1,2)  # [B, N_tokens, E]
+        return x, (Hp, Wp)
 
-        # Ajustement pour la connexion résiduelle si les dimensions changent
-        self.shortcut = nn.Identity()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride),
-                nn.InstanceNorm2d(out_channels)
-            )
+# ---------------------------
+# Simple Transformer Encoder block (multihead + MLP)
+# ---------------------------
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, dim, num_heads=8, mlp_ratio=4.0, qkv_bias=True, drop=0., attn_drop=0., drop_path_prob=0.):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=attn_drop, batch_first=True)
+        self.drop_path_prob = drop_path_prob
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_dim = int(dim * mlp_ratio)
+        self.mlp = MLP(dim, mlp_dim, drop)
 
     def forward(self, x):
-        residual = self.shortcut(x)
-        out = self.conv1(x)
-        out = self.norm1(out)
-        out = self.act1(out)
+        # x: [B, N, D]
+        x_att = self.norm1(x)
+        attn_out, _ = self.attn(x_att, x_att, x_att, need_weights=False)
+        x = x + drop_path(attn_out, self.drop_path_prob, self.training)
+        x_mlp = self.norm2(x)
+        x = x + drop_path(self.mlp(x_mlp), self.drop_path_prob, self.training)
+        return x
 
-        out = self.conv2(out)
-        out = self.norm2(out)
+class TransformerEncoder(nn.Module):
+    def __init__(self, depth, dim, **kwargs):
+        super().__init__()
+        self.layers = nn.ModuleList([TransformerEncoderLayer(dim, **kwargs) for _ in range(depth)])
+        self.norm = nn.LayerNorm(dim)
+    def forward(self, x):
+        for l in self.layers: x = l(x)
+        return self.norm(x)
+
+# ---------------------------
+# Decoder block
+# ---------------------------
+class DecoderBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch, groups=8, dropout=0.0):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch + skip_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=min(groups,out_ch), num_channels=out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=min(groups,out_ch), num_channels=out_ch),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x, skip):
+        x = self.upsample(x)
+        if skip is not None:
+            # center crop if mismatch
+            if skip.shape[2:] != x.shape[2:]:
+                th, tw = x.shape[2:]
+                sh, sw = skip.shape[2:]
+                top = (sh - th) // 2
+                left = (sw - tw) // 2
+                skip = skip[:, :, top:top+th, left:left+tw]
+            x = torch.cat([x, skip], dim=1)
+        else:
+            # no skip available
+            pass
+        return self.conv(x)
+
+# ---------------------------
+# Hybrid Transformer U-Net (2D)
+# ---------------------------
+class HybridTransformerUNet2D(nn.Module):
+    """
+    - Conv encoder (hierarchical) to produce multi-scale skips
+    - At deepest level, create patch tokens from conv features and run Transformer
+    - Project transformer tokens back to spatial map and decode with U-Net like decoder
+    Returns: logits (B, num_classes, H, W) OR (logits, aux1, aux2) if deep_supervision True
+    """
+    def __init__(self,
+                 in_channels=1,
+                 num_classes=4,
+                 base_filters=32,
+                 embed_dim=512,
+                 trans_depth=8,
+                 trans_heads=8,
+                 patch_size=2,
+                 drop_path=0.0,
+                 deep_supervision=True):
+        super().__init__()
+        f = base_filters
+        # encoder: conv stem -> enc1..enc4
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, f, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=min(8,f), num_channels=f),
+            nn.ReLU(inplace=True)
+        )
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(f, f, 3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=min(8,f), num_channels=f),
+            nn.ReLU(inplace=True)
+        )
+        self.pool1 = nn.MaxPool2d(2)
+
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(f, f*2, 3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=min(8,f*2), num_channels=f*2),
+            nn.ReLU(inplace=True)
+        )
+        self.pool2 = nn.MaxPool2d(2)
+
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(f*2, f*4, 3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=min(8,f*4), num_channels=f*4),
+            nn.ReLU(inplace=True)
+        )
+        self.pool3 = nn.MaxPool2d(2)
+
+        # deep features before transformer
+        self.enc4 = nn.Sequential(
+            nn.Conv2d(f*4, f*8, 3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=min(8,f*8), num_channels=f*8),
+            nn.ReLU(inplace=True)
+        )
+        self.pool4 = nn.MaxPool2d(2)
+
+        # project conv features to patch tokens
+        # choose embed_dim and patch_size so that spatial dims reduce reasonably
+        self.patch_emb = PatchEmbedFromFeature(in_ch=f*8, embed_dim=embed_dim, patch_size=patch_size)
+
+        # transformer encoder
+        self.transformer = TransformerEncoder(depth=trans_depth, dim=embed_dim,
+                                              num_heads=trans_heads, mlp_ratio=4.0, drop=0.0,
+                                              attn_drop=0.0, drop_path_prob=drop_path)
+
+        # project tokens back to a spatial feature map
         
-        out += residual # Addition résiduelle
-        out = self.act2(out)
+        self.token_to_map = nn.Linear(embed_dim, f*8)  # maps token dim -> decoder feature channels
+
+        # decoder projection conv to combine reprojected tokens
+        self.decoder_conv_proj = nn.Conv2d(f*8, f*8, 3, padding=1)
+
+        # decoder blocks (mirrors encoder)
+        self.dec4 = DecoderBlock(in_ch=f*8, skip_ch=f*8, out_ch=f*4)
+        self.dec3 = DecoderBlock(in_ch=f*4, skip_ch=f*4, out_ch=f*2)
+        self.dec2 = DecoderBlock(in_ch=f*2, skip_ch=f*2, out_ch=f)
+        self.dec1 = DecoderBlock(in_ch=f, skip_ch=f, out_ch=f)
+
+        # final conv
+        self.final = nn.Sequential(
+            nn.Conv2d(f, f, 3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=min(8,f), num_channels=f),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(f, num_classes, kernel_size=1)
+        )
+
+        self.deep_supervision = deep_supervision
+        if deep_supervision:
+            self.ds1 = nn.Conv2d(f, num_classes, 1)
+            self.ds2 = nn.Conv2d(f*2, num_classes, 1)
+            self.ds3 = nn.Conv2d(f*4, num_classes, 1)
+
+        # init
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_uniform_(m.weight, a=0.0)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        # x: [B, 1, H, W]
+        B, C, H, W = x.shape
+        s = self.stem(x)
+        e1 = self.enc1(s)           # [B, f, H, W]
+        p1 = self.pool1(e1)
+
+        e2 = self.enc2(p1)          # [B, 2f, H/2, W/2]
+        p2 = self.pool2(e2)
+
+        e3 = self.enc3(p2)          # [B, 4f, H/4, W/4]
+        p3 = self.pool3(e3)
+
+        e4 = self.enc4(p3)          # [B, 8f, H/8, W/8]
+        p4 = self.pool4(e4)         # [B, 8f, H/16, W/16]
+
+        # Patch embedding + transformer
+        tokens, (Hp, Wp) = self.patch_emb(p4)     # tokens: [B, N, E]
+        tokens = self.transformer(tokens)         # [B, N, E]
+
+        # map tokens back to spatial map
+        # tokens -> [B, N, D] -> reshape [B, D, Hp, Wp]
+        proj = self.token_to_map(tokens)          # [B, N, D2]
+        B, N, D2 = proj.shape
+        proj = proj.transpose(1,2).reshape(B, D2, Hp, Wp)  # [B, D2, Hp, Wp]
+        proj = self.decoder_conv_proj(proj)       # [B, D2, Hp, Wp]
+
+        # Upsample proj to match p4 spatial if needed (here patch_size reduced spatially by patch_size)
+        # But our patch embedding used conv with stride=patch_size => Hp = H_p4 / patch_size
+        # To recover p4 size do interpolation:
+        p4_up = F.interpolate(proj, size=p4.shape[2:], mode='bilinear', align_corners=False)  # [B, D2, H/16, W/16]
+
+        # Decoder: combine with skips
+        d4 = self.dec4(p4_up, e4)   # -> [B, 4f, H/8, W/8]
+        d3 = self.dec3(d4, e3)      # -> [B, 2f, H/4, W/4]
+        d2 = self.dec2(d3, e2)      # -> [B, f, H/2, W/2]
+        d1 = self.dec1(d2, e1)      # -> [B, f, H, W]
+
+        out = self.final(d1)
+        out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
+
+        if self.deep_supervision:
+            ds3 = F.interpolate(self.ds3(d3), size=(H, W), mode='bilinear', align_corners=False)
+            ds2 = F.interpolate(self.ds2(d2), size=(H, W), mode='bilinear', align_corners=False)
+            ds1 = F.interpolate(self.ds1(d1), size=(H, W), mode='bilinear', align_corners=False)
+            return out, ds1, ds2, ds3
+
         return out
 
-class ImprovedUNet(nn.Module):
-    def __init__(self, num_classes, deep_supervision=True):
-        super().__init__()
-        self.deep_supervision = deep_supervision
-        
-        # Filtres de base (commencer à 32 est ok, 64 capture plus de détails)
-        filters = [32, 64, 128, 256, 512]
-
-        # -------- Encoder (Downsampling) --------
-        # On utilise stride=2 dans le premier conv du bloc au lieu de MaxPool 
-        # pour préserver l'information spatiale.
-        self.enc1 = ResBlock(1, filters[0])
-        self.enc2 = ResBlock(filters[0], filters[1], stride=2)
-        self.enc3 = ResBlock(filters[1], filters[2], stride=2)
-        self.enc4 = ResBlock(filters[2], filters[3], stride=2)
-        
-        # -------- Bottleneck --------
-        self.bottleneck = ResBlock(filters[3], filters[4], stride=2)
-
-        # -------- Decoder (Upsampling) --------
-        # ConvTranspose est bien, mais Bilinear + Conv réduit les artefacts en damier
-        self.up4 = nn.ConvTranspose2d(filters[4], filters[3], kernel_size=2, stride=2)
-        self.dec4 = ResBlock(filters[3] + filters[3], filters[3]) # Concaténation double les canaux d'entrée
-
-        self.up3 = nn.ConvTranspose2d(filters[3], filters[2], kernel_size=2, stride=2)
-        self.dec3 = ResBlock(filters[2] + filters[2], filters[2])
-
-        self.up2 = nn.ConvTranspose2d(filters[2], filters[1], kernel_size=2, stride=2)
-        self.dec2 = ResBlock(filters[1] + filters[1], filters[1])
-
-        self.up1 = nn.ConvTranspose2d(filters[1], filters[0], kernel_size=2, stride=2)
-        self.dec1 = ResBlock(filters[0] + filters[0], filters[0])
-
-        # -------- Deep Supervision Heads --------
-        # Têtes de segmentation à différentes échelles
-        self.final1 = nn.Conv2d(filters[0], num_classes, kernel_size=1)
-        self.final2 = nn.Conv2d(filters[1], num_classes, kernel_size=1)
-        self.final3 = nn.Conv2d(filters[2], num_classes, kernel_size=1)
-
-    def forward(self, x):
-        # Encoder
-        e1 = self.enc1(x)       # [B, 32, H, W]
-        e2 = self.enc2(e1)      # [B, 64, H/2, W/2]
-        e3 = self.enc3(e2)      # [B, 128, H/4, W/4]
-        e4 = self.enc4(e3)      # [B, 256, H/8, W/8]
-
-        # Bottleneck
-        b = self.bottleneck(e4) # [B, 512, H/16, W/16]
-
-        # Decoder 4
-        d4 = self.up4(b)
-        # Gestion des légers décalages de dimension si H/W ne sont pas puissances de 2
-        if d4.shape != e4.shape:
-             d4 = F.interpolate(d4, size=e4.shape[2:], mode='bilinear', align_corners=False)
-        d4 = self.dec4(torch.cat([d4, e4], dim=1))
-        
-        # Decoder 3
-        d3 = self.up3(d4)
-        if d3.shape != e3.shape:
-             d3 = F.interpolate(d3, size=e3.shape[2:], mode='bilinear', align_corners=False)
-        d3 = self.dec3(torch.cat([d3, e3], dim=1))
-
-        # Decoder 2
-        d2 = self.up2(d3)
-        if d2.shape != e2.shape:
-             d2 = F.interpolate(d2, size=e2.shape[2:], mode='bilinear', align_corners=False)
-        d2 = self.dec2(torch.cat([d2, e2], dim=1))
-
-        # Decoder 1
-        d1 = self.up1(d2)
-        if d1.shape != e1.shape:
-             d1 = F.interpolate(d1, size=e1.shape[2:], mode='bilinear', align_corners=False)
-        d1 = self.dec1(torch.cat([d1, e1], dim=1))
-
-        # Sortie finale (Résolution native)
-        out1 = self.final1(d1)
-
-        # Si Deep Supervision activée, on retourne une liste de masques
-        if self.deep_supervision and self.training:
-            out2 = self.final2(d2)
-            out3 = self.final3(d3)
-            # On retourne [Full_Res, Half_Res, Quarter_Res]
-            return [out1, out2, out3]
-        
-        # En mode inférence, on ne retourne que le masque haute résolution
-        return out1
-
-# Test rapide pour vérifier les dimensions
+# ---------------------------
+# Quick sanity check
+# ---------------------------
 if __name__ == "__main__":
-    model = ImprovedUNet(num_classes=4) # 0:BG, 1:RV, 2:Myo, 3:LV
-    x = torch.randn(1, 1, 224, 224)
-    outputs = model(x)
-    print(f"Sortie principale shape: {outputs[0].shape}") # Doit être [1, 4, 224, 224]
-    print(f"Sortie supervision 2 shape: {outputs[1].shape}") # Doit être [1, 4, 112, 112]
+    model = HybridTransformerUNet2D(in_channels=1, num_classes=4, base_filters=32,
+                                    embed_dim=256, trans_depth=6, trans_heads=8, patch_size=2)
+    x = torch.randn(2,1,224,224)
+    y = model(x)
+    if isinstance(y, tuple):
+        print("Output shapes:", [t.shape for t in y])
+    else:
+        print("Output shape:", y.shape)

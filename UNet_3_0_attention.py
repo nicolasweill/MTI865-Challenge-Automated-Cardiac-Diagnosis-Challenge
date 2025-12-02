@@ -67,12 +67,11 @@ class SEBlock(nn.Module):
 
 
 class AttentionGate(nn.Module):
-    """Attention gate for U-Net skip connection (g = decoder feature, x = encoder skip)"""
     def __init__(self, in_channels_x, in_channels_g, inter_channels):
         super().__init__()
         self.W_g = nn.Sequential(
             nn.Conv2d(in_channels_g, inter_channels, kernel_size=1, bias=False),
-            nn.GroupNorm(num_groups=1, num_channels=inter_channels)  # single group ok
+            nn.GroupNorm(num_groups=1, num_channels=inter_channels)
         )
         self.W_x = nn.Sequential(
             nn.Conv2d(in_channels_x, inter_channels, kernel_size=1, bias=False),
@@ -84,11 +83,18 @@ class AttentionGate(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, x, g):
-        # x: skip conn (encoder), g: gating (decoder)
+    def forward(self, x, g, mask=None):
         g1 = self.W_g(g)
         x1 = self.W_x(x)
+
         psi = self.psi(g1 + x1)
+
+        if mask is not None:
+            # resize mask if needed
+            if mask.shape[2:] != psi.shape[2:]:
+                mask = F.interpolate(mask, size=psi.shape[2:], mode='nearest')
+            psi = psi * mask
+
         return x * psi
 
 
@@ -138,19 +144,24 @@ class DecoderBlock(nn.Module):
         self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.use_attention = use_attention
         if use_attention:
-            self.att = AttentionGate(in_channels_x=out_ch, in_channels_g=in_ch, inter_channels=out_ch // 2 if out_ch>=2 else 1)
+            self.att = AttentionGate(in_channels_x=out_ch,
+                                     in_channels_g=in_ch,
+                                     inter_channels=out_ch // 2 if out_ch >= 2 else 1)
         self.conv = ResidualBlock(in_ch + out_ch, out_ch, use_se=True, dropout=dropout)
 
-    def forward(self, x, skip):
+    def forward(self, x, skip, mask=None):
         x = self.upsample(x)
-        # if skip spatial mismatch, center-crop skip to x size
+
         if skip.shape[2:] != x.shape[2:]:
             skip = center_crop(skip, x.shape[2:])
+
         if self.use_attention:
-            skip = self.att(skip, x)
+            skip = self.att(skip, x, mask=mask)
+
         x = torch.cat([x, skip], dim=1)
         x = self.conv(x)
         return x
+
 
 
 def center_crop(tensor, target_spatial):
@@ -166,7 +177,7 @@ def center_crop(tensor, target_spatial):
 # -----------------------
 # Full Enhanced U-Net
 # -----------------------
-class EnhancedUNet(nn.Module):
+class EnhancedUNetAttGate(nn.Module):
     def __init__(self,
                  in_channels=1,
                  num_classes=4,
@@ -232,34 +243,36 @@ class EnhancedUNet(nn.Module):
         # Initialize weights
         self.initialize()
 
-    def forward(self, x):
+    def forward(self, x, masks=None):
+        # masks = [m1, m2, m3, m4] or None
+        m1, m2, m3, m4 = torch.chunk(masks, 4, dim=1)
+
         # Encoder
-        e1 = self.enc1(x)         # [B, f, H, W]
-        e2 = self.enc2(self.pool1(e1))  # [B, 2f, H/2, W/2]
-        e3 = self.enc3(self.pool2(e2))  # [B, 4f, H/4, W/4]
-        e4 = self.enc4(self.pool3(e3))  # [B, 8f, H/8, W/8]
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        e3 = self.enc3(self.pool2(e2))
+        e4 = self.enc4(self.pool3(e3))
 
         # Bottleneck
-        b = self.bottleneck(self.pool4(e4))  # [B, bottleneck_channels, H/16, W/16]
+        b = self.bottleneck(self.pool4(e4))
 
-        # Decoder with skips
-        d4 = self.dec4(b, e4)   # -> [B, 8f, H/8, W/8]
-        d3 = self.dec3(d4, e3)  # -> [B, 4f, H/4, W/4]
-        d2 = self.dec2(d3, e2)  # -> [B, 2f, H/2, W/2]
-        d1 = self.dec1(d2, e1)  # -> [B, f, H, W]
+        # Decoder (each level uses corresponding mask)
+        d4 = self.dec4(b,  e4, mask=m4)
+        d3 = self.dec3(d4, e3, mask=m3)
+        d2 = self.dec2(d3, e2, mask=m2)
+        d1 = self.dec1(d2, e1, mask=m1)
 
         out = self.final(d1)
 
         if self.deep_supervision:
-            # produce deep supervision outputs, upsample to input size
             ds3 = F.interpolate(self.ds3(d3), size=x.shape[2:], mode='bilinear', align_corners=False)
             ds2 = F.interpolate(self.ds2(d2), size=x.shape[2:], mode='bilinear', align_corners=False)
             ds1 = F.interpolate(self.ds1(d1), size=x.shape[2:], mode='bilinear', align_corners=False)
             out = F.interpolate(out, size=x.shape[2:], mode='bilinear', align_corners=False)
-            # return main + ds outputs (use weighting in loss)
             return out, ds1, ds2, ds3
 
         return F.interpolate(out, size=x.shape[2:], mode='bilinear', align_corners=False)
+
 
     def initialize(self):
         for m in self.modules():
